@@ -188,6 +188,28 @@
             animation: pulse 1.5s infinite;
         }
 
+        /* SEND BUTTON */
+        #send-btn {
+            width: 45px;
+            height: 45px;
+            border-radius: 50%;
+            background: #007bff;
+            /* Blue for Send */
+            border: none;
+            cursor: pointer;
+            color: white;
+            display: none;
+            /* Hidden by default */
+            align-items: center;
+            justify-content: center;
+            box-shadow: 0 4px 10px rgba(0, 0, 0, 0.3);
+            transition: transform 0.2s, background 0.3s;
+        }
+
+        #send-btn:active {
+            transform: scale(0.9);
+        }
+
         /* Ghost Text for Interim Results */
         .interim {
             color: rgba(255, 255, 255, 0.5);
@@ -241,6 +263,13 @@
                 <div class="ios-input" id="chat-input" contenteditable="true"></div>
             </div>
 
+            <!-- SEND BUTTON (Paper Plane) -->
+            <button id="send-btn">
+                <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor">
+                    <path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"></path>
+                </svg>
+            </button>
+
             <!-- MIC BUTTON -->
             <button id="mic-btn">
                 <svg viewBox="0 0 24 24" width="24" height="24" fill="currentColor">
@@ -259,6 +288,7 @@
     <script>
         const inputDiv = document.getElementById('chat-input');
         const btn = document.getElementById('mic-btn');
+        const sendBtn = document.getElementById('send-btn');
         const chatBody = document.getElementById('chat-body');
 
         // Scroll to bottom
@@ -266,16 +296,33 @@
             chatBody.scrollTop = chatBody.scrollHeight;
         }
 
+        // Toggle Buttons logic
+        function toggleButtons() {
+            const text = inputDiv.innerText.trim();
+            if (text.length > 0) {
+                if (asr && asr.isListening) {
+                    btn.style.display = 'flex';
+                    sendBtn.style.display = 'none';
+                } else {
+                    btn.style.display = 'none';
+                    sendBtn.style.display = 'flex';
+                }
+            } else {
+                btn.style.display = 'flex';
+                sendBtn.style.display = 'none';
+            }
+        }
+
         // Initialize our widget
         const asr = new NativeASR({
-            // Note: Our library supports input/textarea. For contenteditable, we might need a small adapter 
-            // BUT wait, existing library has logic: if(tagName === INPUT) else { innerHTML... }. 
-            // So it supports DIVs!
             inputElement: inputDiv,
             micButton: btn,
             onStatusChange: (status) => {
                 if (status === 'listening') {
-                    // Maybe play a sound?
+                    btn.style.display = 'flex';
+                    sendBtn.style.display = 'none';
+                } else {
+                    toggleButtons();
                 }
             },
             onError: (err) => {
@@ -285,31 +332,44 @@
 
         asr.init();
 
-        // Send message on Enter
+        // Monitor typing
+        inputDiv.addEventListener('input', toggleButtons);
+
+        // Send Logic
+        function sendMessage() {
+            const text = inputDiv.innerText.trim();
+            if (text) {
+                // Add User Message
+                const msgDiv = document.createElement('div');
+                msgDiv.className = 'msg user';
+                msgDiv.innerHTML = text + '<span class="time">' + new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) + '</span>';
+                chatBody.appendChild(msgDiv);
+
+                inputDiv.innerText = '';
+                asr.finalTranscript = ''; // Reset ASR buffer
+
+                toggleButtons(); // Reset buttons
+                scrollToBottom();
+
+                // Fake Bot Reply
+                setTimeout(() => {
+                    const botDiv = document.createElement('div');
+                    botDiv.className = 'msg bot';
+                    botDiv.innerHTML = 'Mesajınız alındı. İşleminiz yapılıyor... <span class="time">' + new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) + '</span>';
+                    chatBody.appendChild(botDiv);
+                    scrollToBottom();
+                }, 1000);
+            }
+        }
+
+        // Send Button Click
+        sendBtn.addEventListener('click', sendMessage);
+
+        // Send on Enter
         inputDiv.addEventListener('keypress', function (e) {
             if (e.key === 'Enter') {
                 e.preventDefault();
-                const text = inputDiv.innerText.trim();
-                if (text) {
-                    // Add User Message
-                    const msgDiv = document.createElement('div');
-                    msgDiv.className = 'msg user';
-                    msgDiv.innerHTML = text + '<span class="time">' + new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) + '</span>';
-                    chatBody.appendChild(msgDiv);
-
-                    inputDiv.innerText = '';
-                    asr.finalTranscript = ''; // Reset ASR buffer
-                    scrollToBottom();
-
-                    // Fake Bot Reply
-                    setTimeout(() => {
-                        const botDiv = document.createElement('div');
-                        botDiv.className = 'msg bot';
-                        botDiv.innerHTML = 'Anlaşıldı, işleminizi yapıyorum... <span class="time">' + new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) + '</span>';
-                        chatBody.appendChild(botDiv);
-                        scrollToBottom();
-                    }, 1000);
-                }
+                sendMessage();
             }
         });
 
