@@ -1,0 +1,16 @@
+# Speech-to-Text System Dependencies
+# OpenAI Whisper - Main STT Engine
+openai-whisper>=20231117
+
+# Web Framework
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+
+# File handling
+python-multipart>=0.0.6
+
+# Audio processing
+pydub>=0.25.1
+
+# WebSocket support (included in uvicorn[standard])
+websockets>=12.0
