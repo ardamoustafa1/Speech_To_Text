@@ -1,0 +1,251 @@
+import asyncio
+import logging
+import json
+import wave
+import io
+import struct
+import aiohttp
+import numpy as np
+import time
+from collections import deque
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+
+# --- Configuration ---
+NATIVE_SERVER_URL = "http://127.0.0.1:8003/inference"
+PORT = 8002 
+
+# --- Logger ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger("NativeProxy")
+
+app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# --- Hallucination Filters ---
+HALLUCINATIONS = {
+    "İzlediğiniz için teşekkürler",
+    "İzlediğiniz için teşekkür ederim",
+    "Abone olmayı unutmayın",
+    "Sears",
+    "MBC",
+    "Altyazı",
+    "Alt yazılar",
+    "teşekkürler",
+    "teşekkür ederim.",
+    "...",
+    ".",
+    " "
+}
+
+def is_hallucination(text):
+    text = text.strip()
+    if not text: return True
+    if text in HALLUCINATIONS: return True
+    # Check for repeating patterns often seen in hallucinations
+    if text.count("teşekkür") > 1: return True
+    return False
+
+def calculate_energy(audio_data):
+    # Calculate RMS energy of the last chunk
+    # audio_data is bytearray of int16
+    if not audio_data: return 0
+    np_data = np.frombuffer(audio_data, dtype=np.int16)
+    return np.sqrt(np.mean(np_data.astype(np.float64)**2))
+
+@app.websocket("/ws/transcribe")
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    logger.info("Client connected")
+    
+    # --- Google-like Real-time Configuration ---
+    SAMPLE_RATE = 16000
+    BYTES_PER_SAMPLE = 2  # 16-bit
+    BYTES_PER_SEC = SAMPLE_RATE * BYTES_PER_SAMPLE
+    
+    # CRITICAL: Small windows for instant response (Google-like)
+    WINDOW_SIZE_MS = 300  # 300ms windows for instant updates
+    WINDOW_SIZE_BYTES = int((WINDOW_SIZE_MS / 1000.0) * BYTES_PER_SEC)
+    WINDOW_SIZE_BYTES = (WINDOW_SIZE_BYTES // 2) * 2  # Ensure even number
+    
+    OVERLAP_MS = 100  # 100ms overlap for smooth transitions
+    OVERLAP_BYTES = int((OVERLAP_MS / 1000.0) * BYTES_PER_SEC)
+    OVERLAP_BYTES = (OVERLAP_BYTES // 2) * 2
+    
+    MIN_INFERENCE_LEN = WINDOW_SIZE_BYTES  # Start inference immediately
+    
+    # VAD Configuration
+    ENERGY_THRESHOLD = 150  # Voice activity threshold
+    SILENCE_THRESHOLD = 50  # Silence threshold
+    
+    # Session state
+    audio_buffer = bytearray()
+    last_inference_pos = 0
+    last_energy_window = deque(maxlen=10)  # Track energy over last chunks
+    is_client_connected = True
+    inference_in_progress = False
+    accumulated_final_text = ""  # Track finalized text
+    
+    async def run_inference(buffer_chunk, is_final=False):
+        """Non-blocking inference function"""
+        nonlocal inference_in_progress, accumulated_final_text
+        
+        if inference_in_progress:
+            return  # Skip if already processing
+        
+        inference_in_progress = True
+        
+        try:
+            # Prepare WAV
+            with io.BytesIO() as wav_io:
+                with wave.open(wav_io, "wb") as wav_file:
+                    wav_file.setnchannels(1)
+                    wav_file.setsampwidth(2)
+                    wav_file.setframerate(SAMPLE_RATE)
+                    wav_file.writeframes(buffer_chunk)
+                
+                wav_bytes = wav_io.getvalue()
+            
+            # Send to C++ Server
+            async with aiohttp.ClientSession() as http_session:
+                form = aiohttp.FormData()
+                form.add_field('file', wav_bytes, filename='audio.wav', content_type='audio/wav')
+                form.add_field('temperature', '0.0')  # Lower for consistency
+                form.add_field('response_format', 'verbose_json')
+                form.add_field('language', 'tr')
+                
+                # Context prompt for better accuracy
+                CONTEXT = "Merhaba, nasılsınız? Ahmet, Mehmet, Ayşe, Fatma, Yılmaz, Öztürk. İstanbul, Ankara, İzmir. Fatura, ödeme, teknik destek, başvuru, randevu."
+                form.add_field('prompt', CONTEXT)
+                
+                # Hallucination suppression
+                form.add_field('no_speech_thold', '0.6')
+                form.add_field('logprob_thold', '-1.0')
+                
+                async with http_session.post(NATIVE_SERVER_URL, data=form, timeout=aiohttp.ClientTimeout(total=2.0)) as response:
+                    if response.status == 200:
+                        result_json = await response.json()
+                        
+                        segments = result_json.get("segments", [])
+                        full_text = result_json.get("text", "").strip()
+                        
+                        # Filter hallucinations
+                        if is_hallucination(full_text):
+                            return
+                        
+                        if len(segments) > 1:
+                            # Multiple segments = finalize all but last
+                            finalized_text = ""
+                            cut_off_time = 0.0
+                            
+                            for i in range(len(segments) - 1):
+                                seg = segments[i]
+                                seg_text = seg['text'].strip()
+                                
+                                if is_hallucination(seg_text):
+                                    continue
+                                
+                                finalized_text += seg_text + " "
+                                cut_off_time = seg['end']
+                            
+                            finalized_text = finalized_text.strip()
+                            
+                            if finalized_text:
+                                accumulated_final_text += finalized_text + " "
+                                await websocket.send_json({
+                                    "type": "final",
+                                    "text": finalized_text
+                                })
+                            
+                            # Send last segment as partial
+                            if segments:
+                                last_seg = segments[-1]
+                                partial_text = last_seg['text'].strip()
+                                if partial_text and not is_hallucination(partial_text):
+                                    await websocket.send_json({
+                                        "type": "partial",
+                                        "text": partial_text
+                                    })
+                        else:
+                            # Single segment = partial result
+                            if full_text and not is_hallucination(full_text):
+                                await websocket.send_json({
+                                    "type": "partial",
+                                    "text": full_text
+                                })
+        
+        except asyncio.TimeoutError:
+            logger.warning("Inference timeout")
+        except Exception as e:
+            logger.error(f"Inference Error: {e}")
+        finally:
+            inference_in_progress = False
+    
+    async with aiohttp.ClientSession() as http_session:
+        try:
+            while is_client_connected:
+                # 1. Receive Audio
+                try:
+                    data = await asyncio.wait_for(websocket.receive_bytes(), timeout=0.1)
+                    
+                    energy = calculate_energy(data)
+                    last_energy_window.append(energy)
+                    
+                    audio_buffer.extend(data)
+                    
+                    # Check if we have enough data for inference
+                    current_pos = len(audio_buffer)
+                    if current_pos - last_inference_pos >= MIN_INFERENCE_LEN:
+                        # Extract window for inference (with overlap)
+                        window_start = max(0, last_inference_pos - OVERLAP_BYTES)
+                        window_end = current_pos
+                        window_chunk = audio_buffer[window_start:window_end]
+                        
+                        if len(window_chunk) >= MIN_INFERENCE_LEN:
+                            # Run inference asynchronously (non-blocking)
+                            asyncio.create_task(run_inference(window_chunk))
+                            
+                            # Update position (with overlap for next window)
+                            last_inference_pos = current_pos - OVERLAP_BYTES
+                            
+                            # Keep buffer size manageable (keep last 2 seconds)
+                            max_buffer_size = BYTES_PER_SEC * 2
+                            if len(audio_buffer) > max_buffer_size:
+                                keep_from = len(audio_buffer) - max_buffer_size
+                                audio_buffer = audio_buffer[keep_from:]
+                                last_inference_pos = max(0, last_inference_pos - keep_from)
+                    
+                except asyncio.TimeoutError:
+                    # Check for silence and finalize if needed
+                    if len(audio_buffer) > last_inference_pos:
+                        avg_energy = sum(last_energy_window) / len(last_energy_window) if last_energy_window else 0
+                        
+                        # If silence detected, process remaining buffer
+                        if avg_energy < SILENCE_THRESHOLD and len(audio_buffer) - last_inference_pos > MIN_INFERENCE_LEN:
+                            remaining_chunk = audio_buffer[last_inference_pos:]
+                            if len(remaining_chunk) >= MIN_INFERENCE_LEN:
+                                asyncio.create_task(run_inference(remaining_chunk, is_final=True))
+                                last_inference_pos = len(audio_buffer)
+                    
+                    await asyncio.sleep(0.05)  # Small sleep to prevent CPU spinning
+                    
+                except WebSocketDisconnect:
+                    is_client_connected = False
+                    break
+                except Exception as e:
+                    logger.error(f"Receive error: {e}")
+                    await asyncio.sleep(0.1)
+
+        except Exception as e:
+            logger.error(f"Global Error: {e}")
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=PORT)
